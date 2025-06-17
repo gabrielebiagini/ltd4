@@ -2,7 +2,7 @@ streamlit
 openai
 numpy
 pandas
-tensorflow==2.13.0
+tensorflow
 tensorflow_hub
 keras
 opencv-python-headless
