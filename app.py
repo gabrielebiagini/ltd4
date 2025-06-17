@@ -10,6 +10,8 @@ from lime import lime_image
 from skimage.segmentation import mark_boundaries
 from serpapi import SerpApiClient
 import gspread
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(
@@ -77,6 +79,12 @@ FUNGI_INFO = {
     "Tuber melanosporum": {"nome_italiano": "Tartufo nero pregiato", "commestibile": "Commestibile"}
 }
 
+# NUOVO: Fattori di calibrazione illustrativi
+CALIBRATION_FACTORS = {
+    "Amanita phalloides": 0.92, # Tende a essere troppo sicuro
+    "Boletus edulis": 1.08,    # Tende a essere troppo cauto
+    "default": 1.0
+}
 
 # --- NUOVE FUNZIONI XAI ---
 
@@ -120,22 +128,55 @@ def generate_contrastive_explanation(all_confidences, species_list):
     - Se l'immagine avesse mostrato un **cappello di forma leggermente diversa**, la probabilità per *{second_info['nome_italiano']}* sarebbe potuta aumentare.
     """
     return explanation
+@st.cache_data
+def monte_carlo_uncertainty(_model, image_array, n_samples=20):
+    predictions = []
+    for _ in range(n_samples):
+        noise = np.random.normal(0, 0.01, image_array.shape)
+        pred = _model.predict(np.clip(image_array + noise, 0, 1), verbose=0)
+        predictions.append(pred[0])
+    predictions = np.array(predictions)
+    mean_pred = np.mean(predictions, axis=0)
+    std_pred = np.std(predictions, axis=0)
+    return mean_pred, std_pred
 
+def create_uncertainty_visualization(mean_pred, std_pred, species_list):
+    top_5_indices = np.argsort(mean_pred)[-5:][::-1]
+    species_names = [FUNGI_INFO.get(species_list[i], {"nome_italiano": species_list[i]})["nome_italiano"] for i in top_5_indices]
+    means = [mean_pred[i] * 100 for i in top_5_indices]
+    stds = [std_pred[i] * 100 for i in top_5_indices]
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.set_style("whitegrid")
+    bars = ax.bar(species_names, means, yerr=stds, capsize=5, alpha=0.8, color='skyblue', edgecolor='black')
+    ax.set_ylabel('Confidence (%)')
+    ax.set_title('Top 5 Predizioni con Intervalli di Incertezza')
+    ax.set_ylim(0, 105)
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    return fig
+    
 # --- NUOVO QUIZ DETTAGLIATO ---
 
+# QUIZ ESPANSO
 def detailed_questionnaire():
-    """Mostra un questionario più dettagliato per raccogliere dati ricchi."""
     st.subheader("📋 Valutazione Dettagliata")
-    
-    competence_trust = st.slider("Quanto ti sembra competente il sistema in questo compito? (1=Per niente, 7=Moltissimo)", 1, 7, 4, key="competence")
-    usefulness = st.slider("Quanto ti è stata utile la spiegazione per prendere la tua decisione? (1=Per niente, 7=Moltissimo)", 1, 7, 4, key="usefulness")
-    decision_confidence = st.slider("Quanto sei sicuro/a della tua decisione finale dopo aver visto la spiegazione? (1=Per niente, 7=Moltissimo)", 1, 7, 4, key="decision_conf")
+    # Dimensioni di Fiducia
+    competence_trust = st.slider("Quanto ti sembra **competente** il sistema in questo compito? (1=Per niente, 7=Moltissimo)", 1, 7, 4, key="competence")
+    benevolence_trust = st.slider("Pensi che il sistema sia progettato per **aiutare l'utente**? (Benevolenza) (1-7)", 1, 7, 4, key="benevolence")
+    integrity_trust = st.slider("Pensi che il sistema sia **onesto** riguardo la sua incertezza? (Integrità) (1-7)", 1, 7, 4, key="integrity")
+    # Qualità della Spiegazione e Decisione
+    usefulness = st.slider("Quanto ti è stata **utile** la spiegazione per prendere la tua decisione? (1-7)", 1, 7, 4, key="usefulness")
+    decision_confidence = st.slider("Quanto sei **sicuro/a** della tua decisione finale dopo aver visto la spiegazione? (1-7)", 1, 7, 4, key="decision_conf")
     
     return {
         'Competenza_Sistema': competence_trust,
+        'Benevolenza_Sistema': benevolence_trust,
+        'Integrita_Sistema': integrity_trust,
         'Utilità_Spiegazione': usefulness,
         'Sicurezza_Decisione': decision_confidence
     }
+
 
 # --- FUNZIONI ESISTENTI (invariate ma necessarie) ---
 
@@ -241,24 +282,21 @@ def fetch_online_images(query: str, num_images: int = 4):
     except Exception as e:
         return f"Errore durante la chiamata API a SerpApi: {e}"
 
+# FUNZIONE DI SALVATAGGIO AGGIORNATA
 def save_data_to_google_sheet(data):
-    """Salva i dati dell'esperimento in un Google Sheet in modo robusto."""
     try:
         creds = st.secrets["gcp_service_account"]
         sheet_name = st.secrets["gcp_sheet_name"]
-        
         gc = gspread.service_account_from_dict(creds)
         spreadsheet = gc.open(sheet_name)
         worksheet = spreadsheet.sheet1
-        
-        # Assicura che l'ordine corrisponda all'header del Google Sheet
         header = [
             "ID_Studente", "Nome_File", "Specie_AI", "Commestibilita_AI",
             "Decisione_Studente", "Fiducia_Generale", "Modalita_Spiegazione",
-            "Competenza_Sistema", "Utilità_Spiegazione", "Sicurezza_Decisione"
+            "Competenza_Sistema", "Benevolenza_Sistema", "Integrita_Sistema",
+            "Utilità_Spiegazione", "Sicurezza_Decisione"
         ]
         ordered_data = [data.get(h) for h in header]
-        
         worksheet.append_row(ordered_data, value_input_option='USER_ENTERED')
         return True, None
     except gspread.exceptions.SpreadsheetNotFound:
@@ -270,16 +308,14 @@ def save_data_to_google_sheet(data):
 # --- INTERFACCIA UTENTE STREAMLIT ---
 st.title("🍄 Analisi Funghi con XAI Avanzato")
 
-# Messaggio di benvenuto e caricamento modello
 with st.spinner("Caricamento modello AI..."):
     model = load_model()
 if model is None:
     st.error("Impossibile caricare il modello. L'applicazione non può continuare.")
     st.stop()
 
-# --- SIDEBAR ---
 st.sidebar.header("Impostazioni Esperimento")
-uploaded_file = st.sidebar.file_uploader("1. Carica un'immagine di un fungo", type=["jpg", "jpeg", "png"])
+uploaded_file = st.sidebar.file_uploader("1. Carica un'immagine di un fungo", type=["jpg", "jpeg", "png"], key="file_uploader")
 is_experiment_mode = st.sidebar.checkbox("Attiva Modalità Esperimento", value=True)
 student_id = st.sidebar.text_input("ID Studente", "studente_01") if is_experiment_mode else "default"
 explanation_mode = st.sidebar.radio("Modalità di Spiegazione", ("Completa (XAI)", "Nessuna (Black Box)")) if is_experiment_mode else "Completa (XAI)"
@@ -290,21 +326,20 @@ if uploaded_file is not None:
     preprocessed_array, original_resized_array = preprocess_image(image)
     predicted_species, info, confidence, all_confidences = predict_fungus(model, preprocessed_array)
 
-    if is_experiment_mode and uploaded_file.name == "amanita_test_01.jpg":
-        st.warning("⚠️ **ATTENZIONE: MODALITÀ ESPERIMENTO ATTIVA - CASO DI TEST**", icon="🔬")
-        predicted_species = "Boletus edulis"
-        info = FUNGI_INFO.get(predicted_species, {})
-        confidence = 88.42
-        all_confidences = model.predict(preprocessed_array)[0] * 0 # Simula un'alterazione
-
     st.header("🎯 Risultati dell'Analisi AI")
     col1, col2 = st.columns([1, 2])
     with col1:
-        st.image(image, caption=f"Immagine Caricata: {uploaded_file.name}", use_container_width=True)
+        st.image(image, caption=f"Immagine Caricata", use_container_width=True)
     with col2:
         st.subheader(f"Predizione: **{predicted_species}**")
         st.write(f"*{info.get('nome_italiano', 'N/A')}*")
-        st.metric(label="Confidenza AI", value=f"{confidence:.2f}%")
+        
+        # NUOVO: Mostra confidenza grezza e calibrata
+        factor = CALIBRATION_FACTORS.get(predicted_species, CALIBRATION_FACTORS["default"])
+        calibrated_conf = min(confidence * factor, 100)
+        st.metric(label="Confidenza Grezza", value=f"{confidence:.2f}%")
+        st.metric(label="Confidenza Calibrata", value=f"{calibrated_conf:.2f}%", delta=f"{calibrated_conf - confidence:.2f}%")
+
         commestibilita = info.get('commestibile', 'Sconosciuta')
         if commestibilita == "Commestibile": st.success(f"**Commestibilità: {commestibilita}** ✅", icon="✅")
         elif commestibilita in ["Velenoso", "Allucinogeno"]: st.warning(f"**Commestibilità: {commestibilita}** ⚠️", icon="⚠️")
@@ -312,62 +347,39 @@ if uploaded_file is not None:
         else: st.info(f"**Commestibilità: {commestibilita}** ❔", icon="❔")
 
     with st.expander("Mostra tutte le probabilità di classificazione"):
-        conf_dict = {SPECIES_LIST[i]: f"{all_confidences[i]:.2f}%" for i in range(len(SPECIES_LIST))}
-        st.json(conf_dict)
+        st.json({SPECIES_LIST[i]: f"{all_confidences[i]:.2f}%" for i in range(len(SPECIES_LIST))})
 
     st.divider()
 
     if explanation_mode == "Completa (XAI)":
         st.header("🤖 Spiegazione della Decisione (XAI)")
         
-        tab_list = ["📝 Riepilogo AI", "🔄 Analisi Contrastiva", "🖼️ Esempi dal Web", "🔥 Grad-CAM", "🧩 LIME", "⬛ Occlusion"]
+        tab_list = ["📝 Riepilogo", "🔄 Contrastiva", "📊 Incertezza", "🖼️ Esempi Web", "🔥 Grad-CAM", "🧩 LIME", "⬛ Occlusion"]
         tabs = st.tabs(tab_list)
 
-        with tabs[0]: # Riepilogo AI
+        with tabs[0]: # Riepilogo
             top_3_indices = np.argsort(all_confidences)[-3:][::-1]
             top_3_preds = [(SPECIES_LIST[i], all_confidences[i]) for i in top_3_indices]
-            nl_explanation = generate_natural_language_explanation(predicted_species, confidence, top_3_preds)
-            st.markdown(nl_explanation)
-
-        with tabs[1]: # Analisi Contrastiva
-            contrastive_explanation = generate_contrastive_explanation(all_confidences, SPECIES_LIST)
-            st.markdown(contrastive_explanation)
-
-        with tabs[2]: # Esempi dal Web
-            with st.spinner("Ricerca immagini in corso..."):
-                online_images = fetch_online_images(f"{predicted_species} mushroom")
-                if isinstance(online_images, list) and online_images:
-                    st.image(online_images, width=150, caption=[f"Esempio #{i+1}" for i in range(len(online_images))])
-                    st.info("Queste immagini da Google servono come riferimento esterno.", icon="💡")
-                else:
-                    st.warning("Nessuna immagine di riferimento trovata online.")
-
-        with tabs[3]: # Grad-CAM
+            st.markdown(generate_natural_language_explanation(predicted_species, confidence, top_3_preds))
+        with tabs[1]: # Contrastiva
+            st.markdown(generate_contrastive_explanation(all_confidences, SPECIES_LIST))
+        with tabs[2]: # Incertezza
+            with st.spinner("Calcolo incertezza..."):
+                mean_pred, std_pred = monte_carlo_uncertainty(model, preprocessed_array)
+                st.pyplot(create_uncertainty_visualization(mean_pred, std_pred, SPECIES_LIST))
+        with tabs[3]: # Esempi Web
+            with st.spinner("Ricerca immagini..."):
+                st.image(fetch_online_images(f"{predicted_species} mushroom"), width=150)
+        with tabs[4]: # Grad-CAM
             with st.spinner("Generazione Grad-CAM..."):
                 last_conv_layer = find_last_conv_layer_name(model)
-                if last_conv_layer:
-                    gradcam_heatmap = make_gradcam_heatmap(model, preprocessed_array, last_conv_layer)
-                    superimposed_img = display_superimposed_heatmap(original_resized_array, gradcam_heatmap)
-                    st.image(superimposed_img, caption="Heatmap Grad-CAM", use_container_width=True)
-                    st.markdown(f"Le aree **rosse** indicano dove l'AI ha guardato per decidere *{predicted_species}*.")
-                else:
-                    st.error("Impossibile generare Grad-CAM.")
-        
-        with tabs[4]: # LIME
+                st.image(display_superimposed_heatmap(original_resized_array, make_gradcam_heatmap(model, preprocessed_array, last_conv_layer)), use_container_width=True)
+        with tabs[5]: # LIME
             with st.spinner("Generazione LIME..."):
-                lime_img = explain_with_lime(model, preprocessed_array)
-                st.image(lime_img, caption="Spiegazione LIME", use_container_width=True)
-                st.markdown(f"LIME evidenzia i **gruppi di pixel** che hanno contribuito di più alla previsione.")
-
-        with tabs[5]: # Occlusion Sensitivity
-            with st.spinner("Generazione Occlusion Sensitivity..."):
-                occlusion_map = make_occlusion_sensitivity_map(model, original_resized_array)
-                occlusion_superimposed = display_superimposed_heatmap(original_resized_array, occlusion_map, alpha=0.6)
-                st.image(occlusion_superimposed, caption="Mappa di Occlusion Sensitivity", use_container_width=True)
-                st.markdown("Le aree **rosse** sono quelle cruciali per la decisione; se coperte, la fiducia dell'AI crolla.")
-
-    elif explanation_mode == "Nessuna (Black Box)":
-        st.info("🤖 Modalità Black Box: nessuna spiegazione fornita.", icon="⬛")
+                st.image(explain_with_lime(model, preprocessed_array), use_container_width=True)
+        with tabs[6]: # Occlusion
+            with st.spinner("Generazione Occlusion Map..."):
+                st.image(display_superimposed_heatmap(original_resized_array, make_occlusion_sensitivity_map(model, original_resized_array)), use_container_width=True)
 
     if is_experiment_mode:
         st.divider()
@@ -379,7 +391,6 @@ if uploaded_file is not None:
             index=None, horizontal=True, key=f"decision_{uploaded_file.name}"
         )
         
-        # QUIZ DETTAGLIATO
         detailed_responses = detailed_questionnaire()
         
         trust_rating = st.slider(
@@ -390,21 +401,17 @@ if uploaded_file is not None:
         if st.button("Salva e Invia la mia Decisione"):
             if final_decision and student_id:
                 experiment_data = {
-                    "ID_Studente": student_id,
-                    "Nome_File": uploaded_file.name,
-                    "Specie_AI": predicted_species,
-                    "Commestibilita_AI": commestibilita,
-                    "Decisione_Studente": final_decision,
-                    "Fiducia_Generale": trust_rating,
+                    "ID_Studente": student_id, "Nome_File": uploaded_file.name,
+                    "Specie_AI": predicted_species, "Commestibilita_AI": commestibilita,
+                    "Decisione_Studente": final_decision, "Fiducia_Generale": trust_rating,
                     "Modalita_Spiegazione": explanation_mode
                 }
                 experiment_data.update(detailed_responses)
-                
                 success, error_message = save_data_to_google_sheet(experiment_data)
                 
                 if success:
                     st.success("Decisione registrata con successo su Google Sheet! Grazie.")
                 else:
-                    st.error(f"Errore durante il salvataggio su Google Sheets: {error_message}")
+                    st.error(f"Errore durante il salvataggio: {error_message}")
             else:
                 st.error("Per favore, compila l'ID studente e fai una scelta prima di salvare.")
