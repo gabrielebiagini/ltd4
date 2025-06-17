@@ -2,7 +2,6 @@ streamlit
 openai
 numpy
 pandas
-scikit_learn
 tensorflow==2.13.0
 tensorflow_hub
 keras
@@ -19,3 +18,4 @@ serpapi
 google-search-results
 gspread
 gspread-dataframe
+scikit_learn
