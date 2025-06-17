@@ -19,4 +19,3 @@ serpapi
 google-search-results
 gspread
 gspread-dataframe
-scikit-image
